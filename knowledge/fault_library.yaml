@@ -1,0 +1,255 @@
+# Manastone Diagnostic 故障知识库 (Skill Library)
+# 版本: v0.1
+
+faults:
+  - id: FK-001
+    name: 关节编码器通信异常
+    category: joints
+    severity: CRITICAL
+    detection:
+      conditions:
+        - metric: encoder_status
+          operator: "!="
+          value: 0
+    symptoms:
+      - 关节位置数据异常或丢失
+      - 电机无法闭环控制
+    root_cause_explanation: |
+      编码器是电机闭环控制的关键传感器。当编码器通信中断时，
+      电机控制器无法获取转子位置，导致无法精确控制力矩和速度。
+      G1 使用磁编码器，可能因磁场干扰、线缆松动或编码器损坏导致通信异常。
+    possible_causes:
+      - 编码器线缆松动或断裂
+      - 编码器芯片损坏
+      - 强磁场干扰
+      - 电机控制器故障
+    repair_guide:
+      immediate:
+        - 立即停机，断电
+        - 检查编码器线缆连接
+      short_term:
+        - 使用示波器检查编码器信号波形
+        - 更换编码器线缆测试
+      long_term:
+        - 如编码器损坏，联系售后更换电机模组
+
+  - id: FK-002
+    name: 关节电机过流保护
+    category: joints
+    severity: CRITICAL
+    detection:
+      conditions:
+        - metric: motor_current
+          operator: ">"
+          value: 40
+          duration: 1s
+    symptoms:
+      - 电机突然停止
+      - 报错 "Over Current"
+      - 可能伴随烧焦味
+    root_cause_explanation: |
+      电机控制器检测到电流超过安全阈值，触发保护性停机。
+      这可能是机械卡死、短路、或控制参数不当导致。
+      持续过流可能烧毁电机驱动芯片。
+    possible_causes:
+      - 机械卡死或碰撞
+      - 电机相线短路
+      - 减速器损坏导致堵转
+      - 电流环 PID 参数不当
+    repair_guide:
+      immediate:
+        - 立即停机，检查是否有机械卡死
+        - 检查电机温度
+      short_term:
+        - 手动转动关节，检查是否顺畅
+        - 检查电机相线绝缘
+      long_term:
+        - 如减速器损坏，需更换
+        - 调整电流环参数
+
+  - id: FK-003
+    name: 关节过热保护
+    category: joints
+    severity: WARNING
+    detection:
+      conditions:
+        - metric: temperature
+          operator: ">"
+          value: 60
+    symptoms:
+      - 关节区域发烫
+      - 报错 "Winding Overheated"
+      - 电机自动停机
+    root_cause_explanation: |
+      电机绕组温度超过安全阈值（通常 60-65°C），触发保护。
+      关节电机为内转子 PMSM，靠空气对流散热。
+      膝关节承受最大负荷（站立时约 60% 体重），最容易过热。
+      持续高温会损坏电机绝缘，降低寿命。
+    possible_causes:
+      - 持续高负载运行
+      - 环境温度过高
+      - 散热口堵塞
+      - 减速器润滑脂老化，摩擦增大
+      - 电机参数不当，效率低
+    repair_guide:
+      immediate:
+        - 停止运行，等待 15-20 分钟自然冷却
+        - 检查关节外壳通风口是否堵塞
+      short_term:
+        - 使用压缩空气清洁散热口
+        - 检查环境温度是否过高（应 < 40°C）
+      long_term:
+        - 累计运行 > 200 小时，建议更换减速器润滑脂
+        - 优化运动规划，减少持续高负载
+        - 调整电机参数提高效率
+
+  - id: FK-004
+    name: LiDAR 点云稀疏/缺失
+    category: sensors
+    severity: WARNING
+    detection:
+      conditions:
+        - metric: point_cloud_density
+          operator: "<"
+          value: 0.5
+    symptoms:
+      - 导航避障异常
+      - 点云可视化稀疏
+      - SLAM 漂移增大
+    root_cause_explanation: |
+      Livox MID-360 是半固态 LiDAR，通过旋转棱镜扫描。
+      点云稀疏通常是因为窗口脏污、或内部 MEMS 振动异常。
+    possible_causes:
+      - LiDAR 窗口脏污或有水滴
+      - 强光干扰
+      - 内部 MEMS 故障
+      - 通信丢包
+    repair_guide:
+      immediate:
+        - 清洁 LiDAR 光学窗口
+        - 避免直视强光
+      short_term:
+        - 检查通信线缆
+        - 重启 LiDAR 驱动
+      long_term:
+        - 如持续异常，联系售后检测
+
+  - id: FK-005
+    name: RealSense 初始化失败
+    category: sensors
+    severity: WARNING
+    detection:
+      conditions:
+        - metric: camera_status
+          operator: "=="
+          value: "error"
+    symptoms:
+      - 深度图无法获取
+      - 视觉感知功能异常
+    root_cause_explanation: |
+      RealSense D435i 通过 USB 连接。
+      初始化失败通常是供电不足或 USB 带宽问题。
+    possible_causes:
+      - USB 线缆松动
+      - 供电不足
+      - 固件损坏
+      - 摄像头硬件故障
+    repair_guide:
+      immediate:
+        - 检查 USB 连接
+        - 重新插拔摄像头
+      short_term:
+        - 更新 RealSense 固件
+        - 检查 USB 带宽占用
+      long_term:
+        - 如硬件故障，联系售后
+
+  - id: FK-006
+    name: IMU 数据漂移
+    category: sensors
+    severity: NOTICE
+    detection:
+      conditions:
+        - metric: imu_drift
+          operator: ">"
+          value: 0.1
+    symptoms:
+      - 静态时姿态角缓慢变化
+      - 导航精度下降
+    root_cause_explanation: |
+      IMU（惯性测量单元）包含陀螺仪和加速度计。
+      零偏漂移是 MEMS 器件的固有特性，温度变化会加剧漂移。
+    possible_causes:
+      - 温度变化
+      - 长时间未校准
+      - 振动干扰
+    repair_guide:
+      immediate:
+        - 静止放置 30 秒，观察漂移
+      short_term:
+        - 执行 IMU 校准程序
+        - 检查安装稳固性
+      long_term:
+        - 定期校准（建议每月一次）
+
+  - id: FK-007
+    name: 关节位置跟踪误差偏大
+    category: joints
+    severity: NOTICE
+    detection:
+      conditions:
+        - metric: tracking_error
+          operator: ">"
+          value: 0.5
+    symptoms:
+      - 实际位置与指令位置偏差大
+      - 动作不精确
+      - 可能伴随抖动
+    root_cause_explanation: |
+      跟踪误差 = |实际位置 - 指令位置|。
+      误差过大表明控制器无法精确跟随指令，
+      可能是负载过大、摩擦增大、或控制参数不当。
+    possible_causes:
+      - 负载超出额定范围
+      - 减速器磨损
+      - 关节摩擦增大
+      - 控制参数（PID）不当
+    repair_guide:
+      immediate:
+        - 检查当前负载
+        - 降低运动速度
+      short_term:
+        - 检查关节顺滑度
+        - 调整 PID 参数
+      long_term:
+        - 减速器维护或更换
+
+  - id: FK-008
+    name: 灵巧手通信断连
+    category: manipulation
+    severity: WARNING
+    detection:
+      conditions:
+        - metric: hand_connection
+          operator: "=="
+          value: "disconnected"
+    symptoms:
+      - 灵巧手无响应
+      - 手指无法控制
+    root_cause_explanation: |
+      灵巧手通过 CAN 或 RS485 与主控通信。
+      通信断连可能是线缆松动、供电问题、或手控板故障。
+    possible_causes:
+      - 通信线缆松动
+      - 供电不足
+      - 手控板故障
+      - 通信协议冲突
+    repair_guide:
+      immediate:
+        - 检查手控线缆连接
+        - 重新上电
+      short_term:
+        - 检查供电电压
+        - 检查通信波形
+      long_term:
+        - 如手控板损坏，联系售后
