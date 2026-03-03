@@ -6,7 +6,10 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import AsyncIterator
+
+import yaml
 
 from mcp.server.fastmcp import FastMCP, Context
 
@@ -172,58 +175,75 @@ async def compare_joints(mode: str = "left_right", ctx: Context = None) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+def _load_fault_library() -> list[dict]:
+    """从 knowledge/fault_library.yaml 加载故障库"""
+    yaml_path = Path(get_config().knowledge_dir) / "fault_library.yaml"
+    if not yaml_path.exists():
+        logger.warning(f"fault_library.yaml 不存在: {yaml_path}")
+        return []
+    with open(yaml_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data.get("faults", [])
+
+
 @mcp.tool()
 async def lookup_fault(fault_code: str, ctx: Context = None) -> str:
     """
-    故障代码查询工具
-    
+    故障代码查询工具 - 从 knowledge/fault_library.yaml 查询
+
     Args:
-        fault_code: 故障代码 (如 "FK-001" 或 "Winding Overheated")
-    
+        fault_code: 故障代码或关键词 (如 "FK-001"、"过热"、"编码器")
+
     Returns:
-        故障详情
+        JSON 格式的故障详情
     """
-    # TODO: 从 knowledge/fault_library.yaml 加载
-    # 这里先返回模拟数据
-    
-    fault_db = {
-        "FK-001": {
-            "name": "关节编码器通信异常",
-            "severity": "critical",
-            "symptoms": ["关节位置反馈异常", "控制不稳定"],
-            "causes": ["编码器线缆松动", "编码器损坏", "EMI干扰"],
-            "repair_steps": [
-                "1. 检查编码器线缆连接",
-                "2. 重启关节驱动器",
-                "3. 如仍异常，联系售后"
-            ]
-        },
-        "FK-003": {
-            "name": "关节过热保护",
-            "severity": "warning", 
-            "symptoms": ["电机温度超过阈值", "自动停机保护"],
-            "causes": ["持续高负载", "散热不良", "环境温度过高"],
-            "repair_steps": [
-                "1. 等待 15-20 分钟自然冷却",
-                "2. 检查通风口是否堵塞",
-                "3. 降低任务负载或改善散热"
-            ]
-        }
-    }
-    
-    # 模糊匹配
-    for code, info in fault_db.items():
-        if fault_code.upper() in code or fault_code.lower() in info["name"].lower():
-            return json.dumps({
-                "status": "found",
-                "fault_code": code,
-                **info
-            }, ensure_ascii=False, indent=2)
-    
+    faults = _load_fault_library()
+    if not faults:
+        return json.dumps({
+            "status": "error",
+            "message": "故障库未加载"
+        }, ensure_ascii=False)
+
+    query_upper = fault_code.upper()
+    query_lower = fault_code.lower()
+
+    matched = []
+    for fault in faults:
+        fid = fault.get("id", "")
+        name = fault.get("name", "")
+        symptoms = " ".join(fault.get("symptoms", []))
+        causes = " ".join(fault.get("possible_causes", []))
+
+        if (query_upper in fid.upper()
+                or query_lower in name.lower()
+                or query_lower in symptoms.lower()
+                or query_lower in causes.lower()):
+            matched.append(fault)
+
+    if not matched:
+        return json.dumps({
+            "status": "not_found",
+            "message": f"未找到匹配的故障: {fault_code}",
+            "available_ids": [f.get("id") for f in faults]
+        }, ensure_ascii=False, indent=2)
+
+    # 返回最佳匹配（精确码匹配优先）
+    exact = [f for f in matched if query_upper == f.get("id", "").upper()]
+    result = exact[0] if exact else matched[0]
+
+    guide = result.get("repair_guide", {})
     return json.dumps({
-        "status": "not_found",
-        "message": f"未找到故障代码: {fault_code}"
-    }, ensure_ascii=False)
+        "status": "found",
+        "fault_code": result.get("id"),
+        "name": result.get("name"),
+        "severity": result.get("severity"),
+        "symptoms": result.get("symptoms", []),
+        "possible_causes": result.get("possible_causes", []),
+        "immediate_actions": guide.get("immediate", []),
+        "short_term_actions": guide.get("short_term", []),
+        "long_term_actions": guide.get("long_term", []),
+        "root_cause_explanation": result.get("root_cause_explanation", "").strip(),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.resource("g1://system/health")

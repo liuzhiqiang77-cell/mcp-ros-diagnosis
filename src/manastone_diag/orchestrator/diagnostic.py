@@ -43,6 +43,9 @@ class DiagnosticOrchestrator:
     def __init__(self, llm: LLMClient, knowledge_dir: str,
                  skills_dir: str | None = None):
         self.llm = llm
+        # 默认 skills 目录在 knowledge/skills/（包内）
+        if skills_dir is None:
+            skills_dir = os.path.join(knowledge_dir, "skills")
         self.yaml_skills = self._load_yaml_skills(knowledge_dir)
         self.skill_files = self._load_skill_files(skills_dir)
         logger.info(
@@ -63,10 +66,8 @@ class DiagnosticOrchestrator:
             data = yaml.safe_load(f)
         return data.get("faults", [])
 
-    def _load_skill_files(self, skills_dir: str | None) -> list[dict]:
-        """加载 ~/manastone/skills/ 下的 SKILL.md 文件"""
-        if skills_dir is None:
-            skills_dir = os.path.expanduser("~/manastone/skills")
+    def _load_skill_files(self, skills_dir: str) -> list[dict]:
+        """加载 knowledge/skills/ 下的 SKILL.md 文件"""
         skills_path = Path(skills_dir)
         if not skills_path.exists():
             logger.warning(f"Skill 文档目录不存在: {skills_path}")

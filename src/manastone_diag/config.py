@@ -92,6 +92,11 @@ def get_config() -> Config:
     """获取全局配置"""
     global _config
     if _config is None:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
         _config = Config()
         # 从环境变量读取覆盖
         if os.getenv("MANASTONE_MOCK_MODE"):
