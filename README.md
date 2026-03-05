@@ -1,6 +1,6 @@
 # Manastone Diagnostic
 
-**G1 语义化运维诊断工具** - 运行在宇树 G1 机载 Orin NX 上的自包含诊断系统。
+**X2 语义化运维诊断工具** - 运行在机器人机载 Orin 上的自包含诊断系统。
 
 ## 特性
 
@@ -37,15 +37,28 @@ manastone-diag  # 启动 MCP Server
 manastone-ui    # 启动 Web UI
 ```
 
-#### 模式 B：连接真机
+#### 模式 B：连接 X2 真机（ROS2）
 
 ```bash
-# 确保 G1 网络可达
-ping 192.168.123.164
-
 # 启动服务
 manastone-diag
 ```
+
+默认会订阅以下 ROS2 话题（来自 X2 部署信息）：
+
+- `/aima/hal/joint/leg/state`
+- `/aima/hal/joint/waist/state`
+- `/aima/hal/joint/arm/state`
+- `/aima/hal/joint/head/state`
+- `/aima/hal/pmu/state`
+
+如需覆盖话题名，可设置环境变量：
+
+- `MANASTONE_TOPIC_JOINT_LEG_STATE`
+- `MANASTONE_TOPIC_JOINT_WAIST_STATE`
+- `MANASTONE_TOPIC_JOINT_ARM_STATE`
+- `MANASTONE_TOPIC_JOINT_HEAD_STATE`
+- `MANASTONE_TOPIC_PMU_STATE`
 
 ### 3. 访问
 

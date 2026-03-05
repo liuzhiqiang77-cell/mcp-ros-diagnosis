@@ -1,15 +1,14 @@
 """
-DDS Bridge - CycloneDDS 订阅和缓存模块
-处理与 G1 的 DDS 通信
+DDS Bridge - X2 ROS2 订阅和缓存模块
 """
 
 import asyncio
-import json
-import time
-from dataclasses import dataclass, field
-from typing import Optional, Callable, Dict, List, Any
-from collections import deque
 import logging
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config import get_config
 
@@ -29,9 +28,7 @@ class JointState:
 
 @dataclass
 class LowState:
-    """G1 LowState 消息结构"""
-    # 根据 unitree_hg::msg::LowState 定义
-    # 实际字段需要根据 IDL 文件调整
+    """统一内部 LowState 消息结构（兼容上层资源和诊断逻辑）"""
     level_flag: int = 0
     comm_version: int = 0
     robot_id: int = 0
@@ -169,15 +166,7 @@ class MockDDSSubscriber:
                 )
 
                 topic = "rt/lf/lowstate"
-                if topic in self.callbacks:
-                    for cb in self.callbacks[topic]:
-                        try:
-                            if asyncio.iscoroutinefunction(cb):
-                                await cb(lowstate)
-                            else:
-                                cb(lowstate)
-                        except Exception as e:
-                            logger.error(f"回调执行错误: {e}")
+                await _dispatch_callbacks(self.callbacks, topic, lowstate)
 
                 await asyncio.sleep(0.5)  # 2 Hz
 
@@ -189,47 +178,210 @@ class MockDDSSubscriber:
 
 
 class DDSSubscriber:
-    """真实 DDS 订阅器（需要 CycloneDDS）"""
-    
-    def __init__(self, domain_id: int = 0):
+    """真实 ROS2 订阅器（读取 X2 话题）"""
+
+    _TOPIC_TO_OFFSET = {
+        "joint_leg_state": 0,
+        "joint_waist_state": 12,
+        "joint_arm_state": 14,
+        "joint_head_state": 26,
+    }
+
+    _NAME_TO_JOINT_ID = {
+        "l_hip_yaw": 0, "left_hip_yaw": 0, "l_hip_pitch": 1, "left_hip_pitch": 1,
+        "l_hip_roll": 2, "left_hip_roll": 2, "l_knee": 3, "left_knee": 3,
+        "l_ankle_pitch": 4, "left_ankle_pitch": 4, "l_ankle_roll": 5, "left_ankle_roll": 5,
+        "r_hip_yaw": 6, "right_hip_yaw": 6, "r_hip_pitch": 7, "right_hip_pitch": 7,
+        "r_hip_roll": 8, "right_hip_roll": 8, "r_knee": 9, "right_knee": 9,
+        "r_ankle_pitch": 10, "right_ankle_pitch": 10, "r_ankle_roll": 11, "right_ankle_roll": 11,
+        "waist_yaw": 12, "torso_yaw": 12, "waist_pitch": 13, "torso_pitch": 13,
+        "l_shoulder_yaw": 14, "left_shoulder_yaw": 14,
+        "l_shoulder_pitch": 15, "left_shoulder_pitch": 15,
+        "l_shoulder_roll": 16, "left_shoulder_roll": 16,
+        "l_elbow": 17, "left_elbow": 17, "l_wrist_pitch": 18, "left_wrist_pitch": 18,
+        "l_wrist_roll": 19, "left_wrist_roll": 19, "r_shoulder_yaw": 20,
+        "right_shoulder_yaw": 20, "r_shoulder_pitch": 21, "right_shoulder_pitch": 21,
+        "r_shoulder_roll": 22, "right_shoulder_roll": 22, "r_elbow": 23,
+        "right_elbow": 23, "r_wrist_pitch": 24, "right_wrist_pitch": 24,
+        "r_wrist_roll": 25, "right_wrist_roll": 25, "neck_yaw": 26,
+        "head_yaw": 26, "neck_pitch": 27, "head_pitch": 27,
+        "neck_roll": 28, "head_roll": 28,
+    }
+
+    def __init__(self, domain_id: int = 0, topics: Optional[Dict[str, str]] = None):
         self.domain_id = domain_id
+        self.topics = topics or {}
         self.callbacks: Dict[str, List[Callable]] = {}
         self._running = False
-        self._participant = None
-    
+        self._rclpy = None
+        self._node = None
+        self._executor = None
+        self._spin_thread: Optional[threading.Thread] = None
+        self._owns_rclpy_context = False
+        self._callback_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._latest_joint_groups: Dict[str, List[JointState]] = {}
+        self._latest_battery_voltage = 0.0
+        self._latest_battery_current = 0.0
+
+    def register_callback(self, topic: str, callback: Callable) -> None:
+        if topic not in self.callbacks:
+            self.callbacks[topic] = []
+        self.callbacks[topic].append(callback)
+        logger.info(f"已注册回调: {topic}")
+
     async def start(self) -> None:
-        """启动 DDS 订阅"""
+        """启动 ROS2 订阅"""
         try:
-            from cyclonedds.domain import DomainParticipant
-            from cyclonedds.topic import Topic
-            from cyclonedds.sub import Subscriber, DataReader
-            from cyclonedds.util import duration
-            
-            # TODO: 需要根据实际的 IDL 定义创建 Topic
-            # 这里先占位，等拿到 unitree_hg IDL 后实现
-            
-            self._participant = DomainParticipant(self.domain_id)
-            logger.info(f"DDS DomainParticipant 已创建 (domain_id={self.domain_id})")
-            
-            # TODO: 创建 Topic 和 DataReader
-            
+            import rclpy
+            from rclpy.executors import MultiThreadedExecutor
+            from rclpy.node import Node
+            from rclpy.qos import (
+                DurabilityPolicy,
+                HistoryPolicy,
+                QoSProfile,
+                ReliabilityPolicy,
+            )
+            from aimdk_msgs.msg import JointStateArray, PmuState
+
+            self._rclpy = rclpy
+            self._owns_rclpy_context = not rclpy.ok()
+            if self._owns_rclpy_context:
+                rclpy.init(args=None)
+
+            self._node = Node("manastone_diag_x2_bridge")
+            qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            )
+
+            for topic_key in self._TOPIC_TO_OFFSET:
+                topic_name = self.topics.get(topic_key)
+                if not topic_name:
+                    continue
+                self._node.create_subscription(
+                    JointStateArray,
+                    topic_name,
+                    lambda msg, k=topic_key: self._on_joint_msg(k, msg),
+                    qos,
+                )
+                logger.info(f"已订阅关节话题: {topic_name} ({topic_key})")
+
+            pmu_topic = self.topics.get("pmu_state")
+            if pmu_topic:
+                self._node.create_subscription(PmuState, pmu_topic, self._on_pmu_msg, qos)
+                logger.info(f"已订阅电源话题: {pmu_topic}")
+
+            self._executor = MultiThreadedExecutor()
+            self._executor.add_node(self._node)
+            self._callback_loop = asyncio.get_running_loop()
             self._running = True
-            logger.info("DDS 订阅器已启动")
-            
+            self._spin_thread = threading.Thread(target=self._spin, daemon=True)
+            self._spin_thread.start()
+            logger.info("ROS2 订阅器已启动")
+
         except ImportError:
-            logger.error("未安装 cyclonedds，请运行: pip install cyclonedds")
+            logger.error("缺少 ROS2 依赖，请确保 rclpy 和 aimdk_msgs 已安装")
             raise
         except Exception as e:
-            logger.error(f"DDS 启动错误: {e}")
+            logger.error(f"ROS2 启动错误: {e}")
             raise
-    
+
+    def _spin(self) -> None:
+        if self._executor is None:
+            return
+        while self._running and self._rclpy and self._rclpy.ok():
+            self._executor.spin_once(timeout_sec=0.2)
+
+    def _on_joint_msg(self, topic_key: str, msg: Any) -> None:
+        self._latest_joint_groups[topic_key] = self._convert_joint_group(topic_key, msg)
+        motor_state: List[JointState] = []
+        for key in ("joint_leg_state", "joint_waist_state", "joint_arm_state", "joint_head_state"):
+            motor_state.extend(self._latest_joint_groups.get(key, []))
+        motor_state.sort(key=lambda j: j.joint_id)
+
+        lowstate = LowState(
+            level_flag=1,
+            comm_version=1,
+            robot_id=2,
+            motor_state=motor_state,
+            bms_state={
+                "battery_voltage": self._latest_battery_voltage,
+                "battery_current": self._latest_battery_current,
+            },
+            timestamp=time.time(),
+        )
+        self._emit_lowstate(lowstate)
+
+    def _on_pmu_msg(self, msg: Any) -> None:
+        self._latest_battery_voltage = float(getattr(msg, "battery_voltage", 0.0))
+        self._latest_battery_current = float(getattr(msg, "battery_current", 0.0))
+
+    def _convert_joint_group(self, topic_key: str, msg: Any) -> List[JointState]:
+        base = self._TOPIC_TO_OFFSET[topic_key]
+        out: List[JointState] = []
+        for idx, joint in enumerate(getattr(msg, "joints", [])):
+            name = str(getattr(joint, "name", "")).lower().replace("-", "_")
+            joint_id = self._NAME_TO_JOINT_ID.get(name, base + idx)
+            temp = float(
+                max(
+                    getattr(joint, "coil_temp", 0.0),
+                    getattr(joint, "motor_temp", 0.0),
+                )
+            )
+            out.append(
+                JointState(
+                    joint_id=joint_id,
+                    position=float(getattr(joint, "position", 0.0)),
+                    velocity=float(getattr(joint, "velocity", 0.0)),
+                    torque=float(getattr(joint, "effort", 0.0)),
+                    temperature=temp,
+                    timestamp=time.time(),
+                )
+            )
+        return out
+
+    def _emit_lowstate(self, lowstate: LowState) -> None:
+        topic = "rt/lf/lowstate"
+        if self._callback_loop and self._callback_loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                _dispatch_callbacks(self.callbacks, topic, lowstate),
+                self._callback_loop,
+            )
+
     async def stop(self) -> None:
-        """停止 DDS 订阅"""
+        """停止 ROS2 订阅"""
         self._running = False
-        if self._participant:
-            # TODO: 清理资源
-            pass
-        logger.info("DDS 订阅器已停止")
+        if self._spin_thread:
+            self._spin_thread.join(timeout=2.0)
+            self._spin_thread = None
+        if self._executor and self._node:
+            self._executor.remove_node(self._node)
+            self._executor.shutdown()
+        if self._node:
+            self._node.destroy_node()
+            self._node = None
+        if self._owns_rclpy_context and self._rclpy and self._rclpy.ok():
+            self._rclpy.shutdown()
+        logger.info("ROS2 订阅器已停止")
+
+
+async def _dispatch_callbacks(
+    callbacks: Dict[str, List[Callable]],
+    topic: str,
+    message: LowState,
+) -> None:
+    if topic not in callbacks:
+        return
+    for cb in callbacks[topic]:
+        try:
+            if asyncio.iscoroutinefunction(cb):
+                await cb(message)
+            else:
+                cb(message)
+        except Exception as e:
+            logger.error(f"回调执行错误: {e}")
 
 
 class DDSBridge:
@@ -248,7 +400,10 @@ class DDSBridge:
         if self.config.mock_mode:
             self._subscriber = MockDDSSubscriber()
         else:
-            self._subscriber = DDSSubscriber(domain_id=self.config.dds.domain_id)
+            self._subscriber = DDSSubscriber(
+                domain_id=self.config.dds.domain_id,
+                topics=self.config.dds.topics,
+            )
         
         # 注册缓存回调
         self._subscriber.register_callback(

@@ -13,9 +13,11 @@ class DDSConfig:
     domain_id: int = 0
     interface: str = "auto"  # 或指定网卡名如 "eth0"
     topics: dict = field(default_factory=lambda: {
-        "lowstate": "rt/lf/lowstate",
-        "sportmodestate": "rt/sportmodestate",
-        "estimator": "rt/EstimatorData",
+        "joint_leg_state": "/aima/hal/joint/leg/state",
+        "joint_waist_state": "/aima/hal/joint/waist/state",
+        "joint_arm_state": "/aima/hal/joint/arm/state",
+        "joint_head_state": "/aima/hal/joint/head/state",
+        "pmu_state": "/aima/hal/pmu/state",
     })
 
 
@@ -103,6 +105,17 @@ def get_config() -> Config:
             _config.mock_mode = os.getenv("MANASTONE_MOCK_MODE").lower() == "true"
         if os.getenv("MANASTONE_DEBUG"):
             _config.debug = os.getenv("MANASTONE_DEBUG").lower() == "true"
+        topic_env_map = {
+            "joint_leg_state": "MANASTONE_TOPIC_JOINT_LEG_STATE",
+            "joint_waist_state": "MANASTONE_TOPIC_JOINT_WAIST_STATE",
+            "joint_arm_state": "MANASTONE_TOPIC_JOINT_ARM_STATE",
+            "joint_head_state": "MANASTONE_TOPIC_JOINT_HEAD_STATE",
+            "pmu_state": "MANASTONE_TOPIC_PMU_STATE",
+        }
+        for topic_key, env_name in topic_env_map.items():
+            val = os.getenv(env_name)
+            if val:
+                _config.dds.topics[topic_key] = val
     return _config
 
 
