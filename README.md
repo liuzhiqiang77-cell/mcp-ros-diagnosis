@@ -71,6 +71,28 @@ manastone-diag
 - `MANASTONE_TOPIC_JOINT_HEAD_STATE`
 - `MANASTONE_TOPIC_PMU_STATE`
 
+### Extension 扩展机制
+
+当前支持两种加载方式（模块内需提供可调用注册函数，默认名 `register`）：
+
+1. **显式配置（兼容现有方式）**
+
+```bash
+export MANASTONE_EXTENSIONS="manastone_diag.extensions.demo_extension"
+manastone-diag
+```
+
+2. **自动发现（推荐给 Pi/插件化部署）**
+
+扩展包安装后，如在 `pyproject.toml` 注册 entry points 组 `manastone_diag.extensions`，服务启动时会自动发现并加载：
+
+```toml
+[project.entry-points."manastone_diag.extensions"]
+my_pi_ext = "my_pi_ext.plugin:register"
+```
+
+加载成功后会新增对应 MCP tools/resources，并在 `g1://system/health` 的 `extensions` 字段中显示已启用扩展。
+
 ### 3. 访问
 
 - **Web UI**: http://192.168.123.164:7860

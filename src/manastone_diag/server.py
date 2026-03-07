@@ -17,6 +17,7 @@ from mcp.server.fastmcp import FastMCP, Context
 from .config import get_config, Config
 from .dds_bridge import DDSBridge
 from .resources.joints import register_joints_resource
+from .extensions import ExtensionRegistry
 
 # 配置日志
 logging.basicConfig(
@@ -31,6 +32,7 @@ class AppState:
     """应用生命周期状态，通过 ctx.request_context.lifespan_context 访问"""
     dds_bridge: DDSBridge
     config: Config
+    loaded_extensions: list[str]
 
 
 @asynccontextmanager
@@ -50,8 +52,21 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppState]:
     register_joints_resource(server, dds_bridge)
     logger.info("✅ Joints Resource 已注册")
 
+    # 加载 extension（支持 MANASTONE_EXTENSIONS + entry points 自动发现）
+    loaded_extensions = await ExtensionRegistry().register_extensions(
+        server, config.extension_modules
+    )
+    if loaded_extensions:
+        logger.info("✅ 已加载 %d 个 extension", len(loaded_extensions))
+    else:
+        logger.info("ℹ️ 未发现可加载的 extension")
+
     try:
-        yield AppState(dds_bridge=dds_bridge, config=config)
+        yield AppState(
+            dds_bridge=dds_bridge,
+            config=config,
+            loaded_extensions=loaded_extensions,
+        )
     finally:
         logger.info("🛑 正在关闭服务...")
         await dds_bridge.stop()
@@ -248,8 +263,12 @@ async def lookup_fault(fault_code: str, ctx: Context = None) -> str:
 
 
 @mcp.resource("g1://system/health")
-async def get_system_health() -> str:
+async def get_system_health(ctx: Context = None) -> str:
     """获取系统整体健康状态"""
+    loaded_extensions: list[str] = []
+    if ctx and ctx.request_context and ctx.request_context.lifespan_context:
+        loaded_extensions = ctx.request_context.lifespan_context.loaded_extensions
+
     return json.dumps({
         "status": "operational",
         "version": "0.1.0",
@@ -257,7 +276,8 @@ async def get_system_health() -> str:
             "dds_bridge": "connected" if not get_config().mock_mode else "mock_mode",
             "cache": "active",
             "llm": "standby"
-        }
+        },
+        "extensions": loaded_extensions,
     }, ensure_ascii=False, indent=2)
 
 
