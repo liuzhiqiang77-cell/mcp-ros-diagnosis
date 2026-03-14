@@ -1,0 +1,71 @@
+# ============================================================
+# Manastone Server Configuration
+# 控制哪些 MCP Server 启动，以及各自的端口和参数
+#
+# 使用方法：
+#   enabled: true  → 随 manastone-launcher 启动
+#   enabled: false → 不启动（硬件不存在时禁用）
+# ============================================================
+
+global:
+  robot_id_env: MANASTONE_ROBOT_ID
+  schema_path: config/robot_schema.yaml
+  storage_dir: storage
+  mock_mode_env: MANASTONE_MOCK_MODE
+
+servers:
+  - id: joints
+    name: manastone-joints
+    enabled: true
+    port: 8081
+    description: 关节电机状态监控（温度、力矩、速度、通信）
+    component_groups: [body_joints]
+    required: true
+
+  - id: power
+    name: manastone-power
+    enabled: true
+    port: 8082
+    description: 电池电压、电流、SOC、温度监控
+    component_groups: [power_system]
+    required: false
+
+  - id: imu
+    name: manastone-imu
+    enabled: true
+    port: 8083
+    description: 机体姿态、倾斜检测
+    component_groups: [imu]
+    required: false
+
+  - id: hand
+    name: manastone-hand
+    enabled: false
+    port: 8084
+    description: 灵巧手关节、抓力、通信状态（DEX3等）
+    component_groups: [dexterous_hand]
+    required: false
+
+  - id: vision
+    name: manastone-vision
+    enabled: false
+    port: 8085
+    description: 相机健康、图像质量、深度传感器（M2）
+    component_groups: [vision]
+    required: false
+
+  - id: motion
+    name: manastone-motion
+    enabled: false
+    port: 8086
+    description: 运动控制器、步态状态、里程计（M2）
+    component_groups: [motion_controller]
+    required: false
+
+  - id: core
+    name: manastone-core
+    enabled: true
+    port: 8080
+    description: 诊断Agent、话题发现、知识库、全局告警聚合
+    component_groups: []
+    required: true
