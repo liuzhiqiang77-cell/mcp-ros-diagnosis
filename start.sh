@@ -1,32 +1,28 @@
-#!/bin/bash
-# 启动 Manastone Diagnostic
+#!/usr/bin/env bash
+# Manastone Diagnostic — startup script
+set -e
 
-echo "🚀 启动 Manastone Diagnostic..."
+cd "$(dirname "$0")"
 
-# 检查是否在 G1 Orin NX 上
-if [[ $(uname -n) == "unitree-desktop" ]] || [[ $(uname -n) == "ubuntu" ]]; then
-    echo "✅ 检测到 G1 Orin NX"
-    MOCK_MODE="false"
-else
-    echo "⚠️ 未检测到 G1，使用模拟数据模式"
-    MOCK_MODE="true"
+# Source ROS2 if available
+if [ -f /opt/ros/humble/setup.bash ]; then
+    source /opt/ros/humble/setup.bash
+    echo "ROS2 Humble sourced"
 fi
 
-export MANASTONE_MOCK_MODE=$MOCK_MODE
-export PYTHONPATH="${PYTHONPATH}:$(pwd)/src"
+# Activate conda env if it exists
+if command -v conda &>/dev/null && conda env list | grep -q "manastone"; then
+    eval "$(conda shell.bash hook)"
+    conda activate manastone
+fi
 
-# 启动 MCP Server（后台）
-echo "📡 启动 MCP Server..."
-python3 -m manastone_diag.server &
-SERVER_PID=$!
-echo "   PID: $SERVER_PID"
+# Default to mock mode if no args
+export MANASTONE_MOCK_MODE="${MANASTONE_MOCK_MODE:-false}"
+export MANASTONE_ROBOT_ID="${MANASTONE_ROBOT_ID:-robot_01}"
 
-sleep 2
+echo "Starting Manastone Diagnostic..."
+echo "  Robot ID : $MANASTONE_ROBOT_ID"
+echo "  Mock mode: $MANASTONE_MOCK_MODE"
+echo ""
 
-# 启动 Web UI
-echo "🌐 启动 Web UI..."
-python3 -m manastone_diag.ui
-
-# 清理
-kill $SERVER_PID 2>/dev/null
-echo "🛑 已停止"
+exec manastone-launcher "$@"

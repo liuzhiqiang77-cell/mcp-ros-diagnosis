@@ -1,0 +1,242 @@
+# ============================================================
+# Manastone Robot Schema — Unitree G1
+# 版本: 1.1  (schema_version 字段)
+#
+# 唯一真相来源：硬件拓扑、字段规则、事件定义全在这里。
+# 切换机器人只需换这个文件，代码不变。
+#
+# message_protocol 说明：
+#   unitree_hg_lowstate  → unitree_hg/msg/LowState，motor_state[]
+#                          位置性数组，motor_index_map 是权威映射
+#                          来自 Unitree SDK G1JointIndex 枚举
+#   unitree_hg_bms       → LowState 内嵌电池字段
+#   unitree_hg_imu       → LowState 内嵌 IMU 字段
+#   standard_joint_state → sensor_msgs/JointState，自带 name[]，
+#                          无需 motor_index_map
+# ============================================================
+
+robot_type: unitree_g1
+robot_variant: "29dof"
+robot_id_env: MANASTONE_ROBOT_ID
+schema_version: "1.1"
+
+topics:
+
+  # ── G1 全身关节（unitree_hg LowState @ 2Hz）─────────────
+  - topic: /lf/lowstate
+    description: G1 全身29个电机状态（低频诊断版）
+    message_type: unitree_hg/msg/LowState
+    message_protocol: unitree_hg_lowstate
+    mock_scenario: g1_lowstate
+    component_group: body_joints
+    poll_hz: 2
+
+    # motor_index_map：来自 Unitree SDK G1JointIndex 枚举
+    # 代码中禁止出现任何硬编码关节索引，所有映射从这里读取
+    motor_index_map:
+      0:  { name: left_hip_pitch,       canonical: 左髋俯仰,   group: leg,  side: left   }
+      1:  { name: left_hip_roll,        canonical: 左髋滚转,   group: leg,  side: left   }
+      2:  { name: left_hip_yaw,         canonical: 左髋偏航,   group: leg,  side: left   }
+      3:  { name: left_knee,            canonical: 左膝关节,   group: leg,  side: left   }
+      4:  { name: left_ankle_pitch,     canonical: 左踝俯仰,   group: leg,  side: left   }
+      5:  { name: left_ankle_roll,      canonical: 左踝滚转,   group: leg,  side: left   }
+      6:  { name: right_hip_pitch,      canonical: 右髋俯仰,   group: leg,  side: right  }
+      7:  { name: right_hip_roll,       canonical: 右髋滚转,   group: leg,  side: right  }
+      8:  { name: right_hip_yaw,        canonical: 右髋偏航,   group: leg,  side: right  }
+      9:  { name: right_knee,           canonical: 右膝关节,   group: leg,  side: right  }
+      10: { name: right_ankle_pitch,    canonical: 右踝俯仰,   group: leg,  side: right  }
+      11: { name: right_ankle_roll,     canonical: 右踝滚转,   group: leg,  side: right  }
+      12: { name: waist_yaw,            canonical: 腰偏航,     group: waist, side: center }
+      13: { name: waist_roll,           canonical: 腰滚转,     group: waist, side: center, variant_29dof_only: true }
+      14: { name: waist_pitch,          canonical: 腰俯仰,     group: waist, side: center, variant_29dof_only: true }
+      15: { name: left_shoulder_pitch,  canonical: 左肩俯仰,   group: arm,  side: left   }
+      16: { name: left_shoulder_roll,   canonical: 左肩滚转,   group: arm,  side: left   }
+      17: { name: left_shoulder_yaw,    canonical: 左肩偏航,   group: arm,  side: left   }
+      18: { name: left_elbow,           canonical: 左肘关节,   group: arm,  side: left   }
+      19: { name: left_wrist_roll,      canonical: 左腕滚转,   group: arm,  side: left   }
+      20: { name: left_wrist_pitch,     canonical: 左腕俯仰,   group: arm,  side: left,  variant_29dof_only: true }
+      21: { name: left_wrist_yaw,       canonical: 左腕偏航,   group: arm,  side: left,  variant_29dof_only: true }
+      22: { name: right_shoulder_pitch, canonical: 右肩俯仰,   group: arm,  side: right  }
+      23: { name: right_shoulder_roll,  canonical: 右肩滚转,   group: arm,  side: right  }
+      24: { name: right_shoulder_yaw,   canonical: 右肩偏航,   group: arm,  side: right  }
+      25: { name: right_elbow,          canonical: 右肘关节,   group: arm,  side: right  }
+      26: { name: right_wrist_roll,     canonical: 右腕滚转,   group: arm,  side: right  }
+      27: { name: right_wrist_pitch,    canonical: 右腕俯仰,   group: arm,  side: right, variant_29dof_only: true }
+      28: { name: right_wrist_yaw,      canonical: 右腕偏航,   group: arm,  side: right, variant_29dof_only: true }
+
+    fields:
+      - path: "motor_state[*].temperature"
+        index_key: motor_index
+        component_template: "joint_{name}"
+        unit: celsius
+        semantic_type: temperature
+        description: 电机温度
+        thresholds:
+          warning:  { value: 50.0, direction: above }
+          critical: { value: 70.0, direction: above }
+        events:
+          warning:  JOINT_TEMP_WARNING
+          critical: JOINT_TEMP_CRITICAL
+          recovery: JOINT_TEMP_NORMAL
+
+      - path: "motor_state[*].tau_est"
+        index_key: motor_index
+        component_template: "joint_{name}"
+        unit: Nm
+        semantic_type: torque
+        description: 估计外部力矩
+        thresholds:
+          warning:  { value: 30.0, direction: above }
+          critical: { value: 45.0, direction: above }
+        events:
+          warning:  JOINT_TORQUE_WARNING
+          critical: JOINT_TORQUE_CRITICAL
+          recovery: JOINT_TORQUE_NORMAL
+
+      - path: "motor_state[*].dq"
+        index_key: motor_index
+        component_template: "joint_{name}"
+        unit: rad/s
+        semantic_type: velocity
+        description: 关节速度
+        thresholds:
+          critical: { value: 20.0, direction: above }
+        events:
+          critical: JOINT_VELOCITY_CRITICAL
+
+      - path: "motor_state[*].lost"
+        index_key: motor_index
+        component_template: "joint_{name}"
+        unit: count
+        semantic_type: communication_loss
+        description: 通信丢失计数
+        thresholds:
+          critical: { value: 0, direction: not_equal }
+        events:
+          critical: JOINT_COMM_LOSS
+          recovery: JOINT_COMM_RECOVERED
+
+  # ── 电池（LowState 电源字段）─────────────────────────────
+  - topic: /lf/lowstate
+    description: 电池管理系统
+    message_type: unitree_hg/msg/LowState
+    message_protocol: unitree_hg_bms
+    mock_scenario: g1_bms
+    component_group: power_system
+    poll_hz: 1
+    fields:
+      - path: "power_v"
+        component: battery_pack
+        unit: V
+        semantic_type: voltage
+        description: 电池总电压
+        thresholds:
+          warning:  { value: 46.0, direction: below }
+          critical: { value: 43.0, direction: below }
+        events:
+          warning:  PMU_VOLTAGE_LOW_WARNING
+          critical: PMU_VOLTAGE_CRITICAL
+          recovery: PMU_VOLTAGE_NORMAL
+
+      - path: "power_a"
+        component: battery_pack
+        unit: A
+        semantic_type: current
+        description: 电池放电电流
+        thresholds:
+          warning:  { value: 20.0, direction: above }
+          critical: { value: 30.0, direction: above }
+        events:
+          warning:  PMU_CURRENT_HIGH_WARNING
+          critical: PMU_CURRENT_CRITICAL
+
+      - path: "bms_state.soc"
+        component: battery_pack
+        unit: percent
+        semantic_type: state_of_charge
+        description: 电量百分比
+        thresholds:
+          warning:  { value: 20.0, direction: below }
+          critical: { value: 10.0, direction: below }
+        events:
+          warning:  PMU_SOC_LOW_WARNING
+          critical: PMU_SOC_CRITICAL
+
+  # ── IMU（LowState IMU 字段）──────────────────────────────
+  - topic: /lf/lowstate
+    description: 惯性测量单元
+    message_type: unitree_hg/msg/LowState
+    message_protocol: unitree_hg_imu
+    mock_scenario: g1_imu
+    component_group: imu
+    poll_hz: 2
+    fields:
+      - path: "imu_state.rpy[0]"
+        component: imu_unit
+        unit: rad
+        semantic_type: roll
+        description: 横滚角
+        thresholds:
+          warning:  { value: 0.35, direction: above }
+          critical: { value: 0.52, direction: above }
+        events:
+          warning:  IMU_TILT_WARNING
+          critical: IMU_TILT_CRITICAL
+          recovery: IMU_TILT_NORMAL
+
+      - path: "imu_state.rpy[1]"
+        component: imu_unit
+        unit: rad
+        semantic_type: pitch
+        description: 俯仰角
+        thresholds:
+          warning:  { value: 0.35, direction: above }
+          critical: { value: 0.52, direction: above }
+        events:
+          warning:  IMU_TILT_WARNING
+          critical: IMU_TILT_CRITICAL
+          recovery: IMU_TILT_NORMAL
+
+# ── 非关节组件（关节由 motor_index_map 自动生成）────────────
+components:
+  power_system:
+    type: battery
+    description: 电池管理系统
+    instances:
+      battery_pack: { name: 主电池组 }
+  imu:
+    type: inertial_sensor
+    description: 惯性测量单元
+    instances:
+      imu_unit: { name: 主IMU, location: torso }
+
+# ── 关节力矩阈值覆盖（额定力矩较大的关节）──────────────────
+component_overrides:
+  joint_left_knee:       { torque_warning_nm: 35.0, torque_critical_nm: 50.0 }
+  joint_right_knee:      { torque_warning_nm: 35.0, torque_critical_nm: 50.0 }
+  joint_left_hip_pitch:  { torque_warning_nm: 40.0, torque_critical_nm: 55.0 }
+  joint_right_hip_pitch: { torque_warning_nm: 40.0, torque_critical_nm: 55.0 }
+
+# ── 事件类型定义 ─────────────────────────────────────────────
+event_types:
+  JOINT_TEMP_WARNING:       { severity: WARNING,  description: 关节温度超过50°C,     retention_days: 30 }
+  JOINT_TEMP_CRITICAL:      { severity: CRITICAL, description: 关节温度超过70°C,     retention_days: 90 }
+  JOINT_TEMP_NORMAL:        { severity: INFO,     description: 关节温度恢复正常,     retention_days: 7  }
+  JOINT_TORQUE_WARNING:     { severity: WARNING,  description: 关节力矩超过警告阈值, retention_days: 30 }
+  JOINT_TORQUE_CRITICAL:    { severity: CRITICAL, description: 关节力矩超过危险阈值, retention_days: 90 }
+  JOINT_TORQUE_NORMAL:      { severity: INFO,     description: 关节力矩恢复正常,     retention_days: 7  }
+  JOINT_VELOCITY_CRITICAL:  { severity: CRITICAL, description: 关节速度超过20rad/s,  retention_days: 90 }
+  JOINT_COMM_LOSS:          { severity: CRITICAL, description: 关节通信丢失,         retention_days: 90 }
+  JOINT_COMM_RECOVERED:     { severity: INFO,     description: 关节通信恢复,         retention_days: 7  }
+  PMU_VOLTAGE_LOW_WARNING:  { severity: WARNING,  description: 电池电压低于46V,      retention_days: 30 }
+  PMU_VOLTAGE_CRITICAL:     { severity: CRITICAL, description: 电池电压低于43V,      retention_days: 90 }
+  PMU_VOLTAGE_NORMAL:       { severity: INFO,     description: 电池电压恢复正常,     retention_days: 7  }
+  PMU_CURRENT_HIGH_WARNING: { severity: WARNING,  description: 放电电流偏高,         retention_days: 30 }
+  PMU_CURRENT_CRITICAL:     { severity: CRITICAL, description: 放电电流超安全阈值,   retention_days: 90 }
+  PMU_SOC_LOW_WARNING:      { severity: WARNING,  description: 电量低于20%,          retention_days: 30 }
+  PMU_SOC_CRITICAL:         { severity: CRITICAL, description: 电量低于10%,          retention_days: 90 }
+  IMU_TILT_WARNING:         { severity: WARNING,  description: 机体倾斜超过20度,     retention_days: 30 }
+  IMU_TILT_CRITICAL:        { severity: CRITICAL, description: 机体倾斜超过30度,     retention_days: 90 }
+  IMU_TILT_NORMAL:          { severity: INFO,     description: 机体姿态恢复正常,     retention_days: 7  }
+  TOPIC_DATA_STALE:         { severity: WARNING,  description: 话题数据超时未更新,   retention_days: 30 }
+  TOPIC_DATA_RECOVERED:     { severity: INFO,     description: 话题数据恢复,         retention_days: 7  }

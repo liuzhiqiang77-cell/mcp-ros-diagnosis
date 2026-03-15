@@ -33,3 +33,11 @@ models/
 .ruff_cache/
 htmlcov/
 .coverage
+
+# Manastone v0.4
+storage/*.db
+config/discovered_schema.yaml
+*.egg-info/
+__pycache__/
+*.pyc
+.env
