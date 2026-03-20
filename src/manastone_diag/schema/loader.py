@@ -131,6 +131,7 @@ class RobotSchema:
     topics: List[TopicSchema]
     components: Dict[str, ComponentInfo]   # component_id → ComponentInfo
     event_types: Dict[str, EventTypeInfo]  # event_type → EventTypeInfo
+    pid_safety_bounds: Dict[str, Dict]     # joint_name → PID 安全边界配置（供 pid_tuner 使用）
 
     def get_topic(self, topic_name: str) -> Optional[TopicSchema]:
         return next((t for t in self.topics if t.topic == topic_name), None)
@@ -201,6 +202,7 @@ class SchemaLoader:
         joint_components = self._generate_joint_components(raw.get("topics", []))
         components.update(joint_components)
         event_types = self._parse_event_types(raw.get("event_types", {}))
+        pid_safety_bounds = raw.get("pid_safety_bounds", {})
 
         schema = RobotSchema(
             robot_type=raw.get("robot_type", "unknown"),
@@ -208,6 +210,7 @@ class SchemaLoader:
             topics=topics,
             components=components,
             event_types=event_types,
+            pid_safety_bounds=pid_safety_bounds,
         )
         logger.info(
             "Schema 加载完成: %s | %d 个话题 | %d 个组件 | %d 种事件类型",
