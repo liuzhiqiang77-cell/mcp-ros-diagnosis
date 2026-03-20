@@ -3,18 +3,21 @@ manastone-pid-tuner
 PID 自动调参 MCP Server
 
 工具列表：
-  pid_safety_check     - 调参前安全检查（温度、电量、通信）
-  pid_run_experiment   - 执行单次阶跃响应实验，返回评分和诊断
-  pid_propose_params   - LLM 驱动的下一组参数建议（含规则兜底）
-  pid_run_auto_tuning  - 全自动调参闭环（感知→决策→执行→评估→迭代）
-  pid_get_history      - 查看某关节的调参历史
-  pid_clear_history    - 清空某关节的调参历史（重新开始）
-  pid_get_best         - 获取历史最优参数
+  pid_safety_check       - 调参前安全检查（温度、电量、通信）
+  pid_run_experiment     - 执行单次阶跃响应实验，返回评分和诊断
+  pid_propose_params     - LLM 驱动的下一组参数建议（含规则兜底）
+  pid_run_auto_tuning    - [Python 循环] 全自动调参（LLM 作为子函数调用）
+  pid_run_research_loop  - [Agent 循环] AutoResearch 风格，LLM 控制外层迭代
+  pid_get_history        - 查看某关节的调参历史
+  pid_clear_history      - 清空某关节的调参历史（重新开始）
+  pid_get_best           - 获取历史最优参数
 
-这个 server 实现了用户提出的三大挑战：
-  [1] 评价函数量化   → pid_run_experiment 返回 0-100 分 + 维度诊断文字
-  [2] 安全围栏       → pid_safety_check + 实验期间实时监控，违规立即中止
-  [3] 环境一致性     → 每次实验前快照电量/温度，在历史记录中标注可比性
+两种自动调参模式的架构区别：
+  pid_run_auto_tuning   → Python for-loop 控制迭代，每轮调 LLM 一次作为子函数
+                          LLM 只负责建议参数，Python 决定何时停止
+  pid_run_research_loop → LLM while-loop 控制迭代（AutoResearch 风格）
+                          LLM 通过 tool_calls 决定每一步：跑实验/查历史/结束
+                          Python 只是工具执行者，不控制迭代逻辑
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ from .base import AppState, init_shared_state, shutdown_shared_state, get_shared
 from ..pid_tuning.safety import SafetyGuard
 from ..pid_tuning.experiment import ExperimentRunner, ExperimentConfig
 from ..pid_tuning.optimizer import TuningHistory, PIDOptimizer
+from ..pid_tuning.agent_loop import PIDAgentLoop
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +456,102 @@ def create_server(**init_kwargs) -> FastMCP:
         }, ensure_ascii=False, indent=2)
 
     # ════════════════════════════════════════════════════════════
-    # Tool 5: 查询历史
+    # Tool 5: AutoResearch Agent 循环（真正的 LLM 驱动迭代）
+    # ════════════════════════════════════════════════════════════
+    @mcp.tool()
+    async def pid_run_research_loop(
+        joint_name: str,
+        max_turns: int = 15,
+        target_score: float = 85.0,
+        setpoint_rad: float = 0.5,
+        experiment_duration_s: float = 2.0,
+        ctx: Context = None,
+    ) -> str:
+        """
+        AutoResearch 风格的 PID 调参 Agent 循环。
+
+        ┌ 架构对比 ──────────────────────────────────────────────┐
+        │ pid_run_auto_tuning  ：Python for-loop 控制迭代        │
+        │                       LLM 是被调用的子函数              │
+        │                       Python 决定何时停止               │
+        │                                                        │
+        │ pid_run_research_loop：LLM while-loop 控制迭代         │
+        │   messages = [task]                                    │
+        │   while True:  ← LLM 是主体                           │
+        │     msg = llm(messages, tools)                         │
+        │     if msg.tool_calls:                                 │
+        │       results = execute(tool_calls)  ← Python 执行    │
+        │       messages += [msg, results]                       │
+        │     else: break  ← LLM 自己决定停                     │
+        └────────────────────────────────────────────────────────┘
+
+        LLM 可在每一轮自主选择：
+          - 调用 run_experiment 测试新参数
+          - 调用 get_history 回顾历史趋势
+          - 调用 finish 结束并提交最终参数
+        LLM 的全部推理过程保留在消息历史中（可追溯）。
+
+        Args:
+            joint_name:           目标关节名
+            max_turns:            最大 LLM 对话轮数（每轮可能调多个工具）
+            target_score:         LLM 知晓的目标分数（写入初始任务消息）
+            setpoint_rad:         阶跃目标位置
+            experiment_duration_s: 每次实验时长
+        """
+        s, safety, runner, history, optimizer = _get_subsystems()
+
+        if not (getattr(s, "llm_client", None) and s.llm_client.is_available()):
+            return json.dumps({
+                "error": (
+                    "pid_run_research_loop 需要 LLM 支持（chat_with_tools）。"
+                    "请配置 OPENAI_API_KEY 或本地 Qwen 端点，"
+                    "或改用 pid_run_auto_tuning（规则兜底模式）。"
+                )
+            }, ensure_ascii=False, indent=2)
+
+        joint_info = _get_joint_info(s, joint_name)
+        if joint_info is None:
+            return json.dumps({"error": f"未找到关节 '{joint_name}'"}, ensure_ascii=False)
+        group = joint_info.get("group", "default")
+        bounds = safety.get_bounds(joint_name, group)
+
+        # 实验前安全检查
+        snapshot = await _get_env_snapshot(s, joint_name)
+        pre_check = safety.pre_experiment_check(
+            joint_name=joint_name,
+            current_temp_c=snapshot.get("joint_temp_c", 25.0),
+            battery_soc_pct=snapshot.get("battery_soc_pct", 100.0),
+            comm_lost=snapshot.get("comm_lost", 0),
+            joint_group=group,
+        )
+        if not pre_check.passed:
+            return json.dumps({
+                "error": "安全检查未通过",
+                "violations": pre_check.violations,
+            }, ensure_ascii=False, indent=2)
+
+        # 启动 Agent 循环（控制权交给 LLM）
+        agent = PIDAgentLoop(
+            llm_client=s.llm_client,
+            runner=runner,
+            history=history,
+            safety=safety,
+        )
+        result = await agent.run(
+            joint_name=joint_name,
+            joint_group=group,
+            target_score=target_score,
+            max_turns=max_turns,
+            bounds=bounds,
+            setpoint_rad=setpoint_rad,
+            experiment_duration_s=experiment_duration_s,
+            mock_mode=s.mock_mode,
+        )
+
+        return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+    # ════════════════════════════════════════════════════════════
+    # Tool 6: 查询历史
     # ════════════════════════════════════════════════════════════
     @mcp.tool()
     async def pid_get_history(
@@ -479,7 +578,7 @@ def create_server(**init_kwargs) -> FastMCP:
         }, ensure_ascii=False, indent=2)
 
     # ════════════════════════════════════════════════════════════
-    # Tool 6: 获取历史最优
+    # Tool 7: 获取历史最优
     # ════════════════════════════════════════════════════════════
     @mcp.tool()
     async def pid_get_best(
@@ -518,7 +617,7 @@ def create_server(**init_kwargs) -> FastMCP:
         }, ensure_ascii=False, indent=2)
 
     # ════════════════════════════════════════════════════════════
-    # Tool 7: 清空历史
+    # Tool 8: 清空历史
     # ════════════════════════════════════════════════════════════
     @mcp.tool()
     async def pid_clear_history(
