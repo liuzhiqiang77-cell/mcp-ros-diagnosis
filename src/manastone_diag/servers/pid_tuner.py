@@ -36,6 +36,7 @@ from ..pid_tuning.safety import SafetyGuard
 from ..pid_tuning.experiment import ExperimentRunner, ExperimentConfig
 from ..pid_tuning.optimizer import TuningHistory, PIDOptimizer
 from ..pid_tuning.agent_loop import PIDAgentLoop
+from ..motion import ScenarioInterpreter, ScenarioLibrary
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +645,230 @@ def create_server(**init_kwargs) -> FastMCP:
             "joint_name": joint_name,
             "deleted_records": deleted,
             "message": f"已清空关节 {joint_name} 的 {deleted} 条历史记录",
+        }, ensure_ascii=False, indent=2)
+
+    # ════════════════════════════════════════════════════════════
+    # Tool 9: 场景库 — 列出所有预置运动场景
+    # ════════════════════════════════════════════════════════════
+    @mcp.tool()
+    async def pid_list_scenarios(
+        robot_type: str = "",
+        ctx: Context = None,
+    ) -> str:
+        """
+        列出所有预置运动场景（用于 pid_run_scenario 的 scenario 参数）。
+
+        场景库覆盖：站立/行走/楼梯/蹲起/抓取/搬运/四足步态/装配等。
+        每个场景包含：名称、关键词、适用机器人、阶段数、建议目标分数。
+
+        Args:
+            robot_type: 按机器人类型过滤（如 "unitree_g1"），空=全部
+        """
+        lib = ScenarioLibrary()
+        if robot_type:
+            scenarios = lib.for_robot(robot_type)
+        else:
+            scenarios = lib.all()
+
+        return json.dumps({
+            "total": len(scenarios),
+            "robot_type_filter": robot_type or "全部",
+            "scenarios": [
+                {
+                    "scenario_id": s.scenario_id,
+                    "name": s.name,
+                    "description": s.description,
+                    "robot_types": s.robot_types or ["通用"],
+                    "phases": len(s.phases),
+                    "target_score_hint": s.target_score_hint,
+                    "keywords": s.keywords,
+                }
+                for s in scenarios
+            ],
+            "usage": (
+                "使用 pid_run_scenario(scenario='<scenario_id>', joint_name='left_knee') "
+                "或 pid_run_scenario(scenario='上楼梯时右膝响应') 来运行场景实验"
+            ),
+        }, ensure_ascii=False, indent=2)
+
+    # ════════════════════════════════════════════════════════════
+    # Tool 10: 场景实验 — NL → 结构化实验配置 → 执行
+    # ════════════════════════════════════════════════════════════
+    @mcp.tool()
+    async def pid_run_scenario(
+        scenario: str,
+        joint_name: str = "",
+        kp: float = 0.0,
+        ki: float = 0.0,
+        kd: float = 0.0,
+        ctx: Context = None,
+    ) -> str:
+        """
+        用自然语言描述一个运动场景，自动翻译为实验配置并执行。
+
+        支持三种输入方式：
+          1. 自然语言: "模拟机器人上楼梯时左膝关节的响应"
+          2. 场景 ID:  "stair_ascent"（用 pid_list_scenarios 查看所有 ID）
+          3. 混合:     "下楼梯 右膝 45度"（关键词+关节+角度）
+
+        翻译策略（自动降级）：
+          LLM 理解 → 关键词匹配 → 兜底构造
+
+        若 kp/ki/kd 全为 0，使用关节的历史最优参数（或默认初始值）进行实验。
+        若指定了 kp/ki/kd，使用指定参数在场景条件下测试。
+
+        Args:
+            scenario:   自然语言描述或场景 ID
+            joint_name: 覆盖场景默认关节（可选）
+            kp/ki/kd:   PID 参数（0=使用历史最优）
+        """
+        s, safety, runner, history, optimizer = _get_subsystems()
+
+        # ── 1. 翻译场景 ──────────────────────────────────────
+        llm_client = getattr(s, "llm_client", None)
+        interpreter = ScenarioInterpreter(
+            llm_client=llm_client,
+            robot_schema=s.schema,
+        )
+        interp_result = await interpreter.interpret(
+            description=scenario,
+            robot_type=s.schema.robot_type,
+        )
+        motion_scenario = interp_result.scenario
+
+        # 如果调用方指定了关节名，优先覆盖
+        if joint_name:
+            motion_scenario = motion_scenario.for_joint(joint_name)
+
+        # ── 2. 逐阶段执行 ────────────────────────────────────
+        phase_results = []
+        best_phase_score = 0.0
+
+        for phase_idx, phase in enumerate(motion_scenario.phases):
+            joint_info = _get_joint_info(s, phase.joint_name)
+            if joint_info is None:
+                phase_results.append({
+                    "phase_label": phase.phase_label,
+                    "joint_name": phase.joint_name,
+                    "error": f"关节 '{phase.joint_name}' 在当前 schema 中不存在，跳过",
+                })
+                continue
+
+            group = joint_info.get("group", "default")
+            bounds = safety.get_bounds(phase.joint_name, group)
+
+            # 确定 PID 参数
+            if kp == 0.0 and ki == 0.0 and kd == 0.0:
+                # 用历史最优，没有历史则用 schema 边界中点作为保守初始值
+                best = history.best(phase.joint_name)
+                if best:
+                    use_kp = best["kp"]
+                    use_ki = best["ki"]
+                    use_kd = best["kd"]
+                    params_source = f"历史最优（score={best['score']:.1f}）"
+                else:
+                    use_kp = (bounds.kp_min + bounds.kp_max) * 0.2
+                    use_ki = 0.0
+                    use_kd = (bounds.kd_min + bounds.kd_max) * 0.1
+                    params_source = "默认初始值（无历史）"
+            else:
+                use_kp, use_ki, use_kd = kp, ki, kd
+                params_source = "指定参数"
+
+            # 参数安全检查
+            param_check = safety.check_pid_params(phase.joint_name, use_kp, use_ki, use_kd, group)
+            if not param_check.passed:
+                phase_results.append({
+                    "phase_label": phase.phase_label,
+                    "joint_name": phase.joint_name,
+                    "error": f"参数安全检查未通过: {param_check.violations}",
+                })
+                continue
+
+            # 采集环境快照
+            snapshot = await _get_env_snapshot(s, phase.joint_name)
+
+            # 执行实验
+            exp_config = ExperimentConfig(
+                joint_name=phase.joint_name,
+                joint_group=group,
+                kp=use_kp,
+                ki=use_ki,
+                kd=use_kd,
+                setpoint_rad=phase.setpoint_rad,
+                duration_s=phase.duration_s,
+                initial_position_rad=phase.initial_position_rad,
+                mock_mode=s.mock_mode,
+            )
+            result = await runner.run(exp_config, env_snapshot=snapshot)
+
+            # 保存到历史
+            history.save(phase.joint_name, {
+                "experiment_id": result.experiment_id,
+                "timestamp": result.timestamp,
+                "kp": use_kp, "ki": use_ki, "kd": use_kd,
+                "score": result.metrics.score,
+                "grade": result.metrics.grade,
+                "overshoot_pct": result.metrics.overshoot_pct,
+                "rise_time_s": result.metrics.rise_time_s,
+                "settling_time_s": result.metrics.settling_time_s,
+                "sse_pct": result.metrics.sse_pct,
+                "oscillation_count": result.metrics.oscillation_count,
+                "diagnosis": result.metrics.diagnosis,
+                "safety_aborted": result.safety_aborted,
+                "env_snapshot": snapshot,
+                "scenario_id": motion_scenario.scenario_id,
+                "phase_label": phase.phase_label,
+            })
+
+            if result.metrics.score > best_phase_score:
+                best_phase_score = result.metrics.score
+
+            phase_results.append({
+                "phase_label": phase.phase_label,
+                "phase_notes": phase.phase_notes,
+                "joint_name": phase.joint_name,
+                "setpoint_rad": phase.setpoint_rad,
+                "params": {"kp": use_kp, "ki": use_ki, "kd": use_kd},
+                "params_source": params_source,
+                "score": result.metrics.score,
+                "grade": result.metrics.grade,
+                "overshoot_pct": result.metrics.overshoot_pct,
+                "rise_time_s": result.metrics.rise_time_s,
+                "settling_time_s": result.metrics.settling_time_s,
+                "diagnosis": result.metrics.diagnosis,
+                "safety_aborted": result.safety_aborted,
+            })
+
+        # ── 3. 汇总结果 ───────────────────────────────────────
+        completed = [p for p in phase_results if "score" in p]
+        avg_score = (
+            sum(p["score"] for p in completed) / len(completed)
+            if completed else 0.0
+        )
+
+        return json.dumps({
+            "scenario": {
+                "id": motion_scenario.scenario_id,
+                "name": motion_scenario.name,
+                "description": motion_scenario.description,
+            },
+            "interpretation": {
+                "method": interp_result.method,
+                "confidence": interp_result.confidence,
+                "reasoning": interp_result.reasoning,
+            },
+            "summary": {
+                "total_phases": len(motion_scenario.phases),
+                "completed_phases": len(completed),
+                "avg_score": round(avg_score, 1),
+                "target_score_hint": motion_scenario.target_score_hint,
+                "suggestion": (
+                    f"场景建议目标分数 {motion_scenario.target_score_hint}，当前均分 {avg_score:.1f}。"
+                    + ("继续用 pid_run_auto_tuning 优化参数。" if avg_score < motion_scenario.target_score_hint else "已达到场景目标！")
+                ),
+            },
+            "phases": phase_results,
         }, ensure_ascii=False, indent=2)
 
     return mcp
