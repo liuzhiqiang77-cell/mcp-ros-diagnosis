@@ -3,15 +3,22 @@ PID 调参实验运行器
 
 解决核心挑战：环境一致性 + 可重复性。
 
-支持两种模式：
-  mock 模式：基于二阶线性系统物理仿真，离线验证调参逻辑
-  real 模式：通过 ROS2 /lowcmd 下发目标位置，读取 /lowstate 采集响应
+支持三种模式：
+  mock_euler  模式：基于二阶线性系统物理仿真（默认，无需额外依赖）
+  mock_mujoco 模式：基于 MuJoCo 物理引擎仿真（需安装 mujoco>=3.0）
+  real        模式：通过 ROS2 /lowcmd 下发目标位置，读取 /lowstate 采集响应
 
-仿真模型（mock 模式）：
+仿真模型（mock_euler 模式）：
   关节被建模为带粘性阻尼的旋转刚体：
     J·dω/dt = u - B·ω
   其中 u 为 PID 控制输出，J 为转动惯量，B 为阻尼系数。
   不同关节组有不同的 J/B 参数，使仿真更接近真实特性。
+
+MuJoCo 模式（mock_mujoco）：
+  使用 MuJoCo 刚体动力学引擎，建模为单关节铰链，
+  通过 actuator/position 驱动，可更准确地模拟非线性摩擦、
+  重力补偿及惯量耦合效应。需要安装 mujoco>=3.0。
+  若 mujoco 未安装，自动回退到 mock_euler 并打印警告。
 """
 from __future__ import annotations
 
@@ -57,6 +64,8 @@ class ExperimentConfig:
     sample_hz: float = 500.0           # 采样率
     initial_position_rad: float = 0.0  # 初始位置
     mock_mode: bool = True
+    # 仿真后端：euler（默认）/ mujoco（需安装 mujoco>=3.0）
+    sim_backend: str = "euler"
 
     def dt(self) -> float:
         return 1.0 / self.sample_hz
@@ -158,9 +167,14 @@ class ExperimentRunner:
         )
 
         if self.mock_mode:
-            times, positions, torques, velocities, aborted, abort_reason = (
-                await self._run_mock(config)
-            )
+            if config.sim_backend == "mujoco":
+                times, positions, torques, velocities, aborted, abort_reason = (
+                    await self._run_mujoco(config)
+                )
+            else:
+                times, positions, torques, velocities, aborted, abort_reason = (
+                    await self._run_mock(config)
+                )
         else:
             times, positions, torques, velocities, aborted, abort_reason = (
                 await self._run_real(config)
@@ -286,6 +300,118 @@ class ExperimentRunner:
             prev_error = error
 
         return times, positions, torques, velocities, False, None
+
+    async def _run_mujoco(
+        self, config: ExperimentConfig
+    ) -> Tuple[List[float], List[float], List[float], List[float], bool, Optional[str]]:
+        """
+        基于 MuJoCo 物理引擎的关节仿真（需要 mujoco>=3.0）。
+
+        建模为单关节铰链（hinge joint），通过 position actuator 驱动，
+        内置 MuJoCo 的刚体动力学求解器计算运动响应。
+        比 Euler 积分更准确：含非线性摩擦、几何惯量、接触动力学。
+
+        若 mujoco 未安装，自动回退到 Euler mock 并记录警告。
+        """
+        try:
+            import mujoco  # noqa: PLC0415
+        except ImportError:
+            logger.warning(
+                "mujoco 未安装（pip install mujoco），回退到 Euler 仿真。"
+                "安装后可获得更精确的物理仿真。"
+            )
+            return await self._run_mock(config)
+
+        physics = _JOINT_PHYSICS.get(config.joint_group, _JOINT_PHYSICS["default"])
+        J = physics["J"]
+        B = physics["B"]
+        bounds = self.safety.get_bounds(config.joint_name, config.joint_group)
+
+        # ── 动态生成 MuJoCo XML 模型 ───────────────────────────
+        # 单关节铰链：转动惯量 J，阻尼 B，PID position actuator
+        xml = f"""
+<mujoco model="pid_joint_test">
+  <option timestep="{config.dt()}" integrator="RK4"/>
+  <worldbody>
+    <body name="link" pos="0 0 0">
+      <inertial pos="0 0 0" mass="{J * 10:.3f}" diaginertia="{J:.4f} {J:.4f} {J:.4f}"/>
+      <joint name="test_joint" type="hinge" axis="0 0 1"
+             damping="{B:.4f}"
+             frictionloss="0.01"
+             range="-3.14159 3.14159"/>
+      <geom type="capsule" size="0.02 0.1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="pid_act" joint="test_joint"
+               kp="{config.kp:.4f}"
+               kv="{config.kd:.4f}"
+               forcerange="-{bounds.max_torque_nm:.1f} {bounds.max_torque_nm:.1f}"/>
+  </actuator>
+</mujoco>
+"""
+        try:
+            model = mujoco.MjModel.from_xml_string(xml)
+            data = mujoco.MjData(model)
+
+            # 设置初始位置
+            data.qpos[0] = config.initial_position_rad
+            data.qvel[0] = 0.0
+            mujoco.mj_forward(model, data)
+
+            n = int(config.duration_s / config.dt())
+            times: List[float] = []
+            positions: List[float] = []
+            torques: List[float] = []
+            velocities: List[float] = []
+
+            integral_e = 0.0
+            prev_error = config.setpoint_rad - config.initial_position_rad
+
+            for i in range(n):
+                # Ki 积分项通过外部累积（MuJoCo position actuator 仅含 Kp+Kd）
+                error = config.setpoint_rad - data.qpos[0]
+                integral_e += error * config.dt()
+                max_integral = 2.0 / (config.ki + 1e-9)
+                integral_e = max(-max_integral, min(max_integral, integral_e))
+                ki_term = config.ki * integral_e
+
+                # 将 Ki 项叠加到 actuator 目标（等效偏置）
+                data.ctrl[0] = config.setpoint_rad + ki_term / (config.kp + 1e-9)
+
+                mujoco.mj_step(model, data)
+
+                torque_actual = float(data.actuator_force[0])
+
+                # 运行时安全检查（每 100 步）
+                if i % 100 == 0 and i > 0:
+                    stop, reason = self.safety.runtime_check(
+                        elapsed_s=data.time,
+                        current_torque_nm=abs(torque_actual),
+                        current_velocity_rad_s=abs(data.qvel[0]),
+                        temp_rise_c=len(torques) * config.dt() * abs(torque_actual) * 0.001,
+                        joint_name=config.joint_name,
+                        joint_group=config.joint_group,
+                    )
+                    if stop:
+                        logger.warning("MuJoCo 实验中止：%s", reason)
+                        return times, positions, torques, velocities, True, reason
+
+                times.append(float(data.time))
+                positions.append(float(data.qpos[0]))
+                torques.append(abs(torque_actual))
+                velocities.append(abs(float(data.qvel[0])))
+                prev_error = error
+
+            logger.info(
+                "MuJoCo 仿真完成：%d 步，最终位置 %.4f rad（目标 %.4f rad）",
+                n, positions[-1], config.setpoint_rad
+            )
+            return times, positions, torques, velocities, False, None
+
+        except Exception as e:
+            logger.error("MuJoCo 仿真异常：%s，回退到 Euler 仿真", e)
+            return await self._run_mock(config)
 
     async def _run_real(
         self, config: ExperimentConfig
