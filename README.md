@@ -5,6 +5,15 @@ Part of the [Snakes™](https://github.com/liuzhiqiang77-cell) Agent Platform
 
 ---
 
+## Persistent memory (MemDir)
+
+This project includes a file-based, auditable persistent memory store (MemDir), inspired by Claude Code.
+
+- Stored under: `storage/memories/<robot_id>/`
+- Used to inject durable context into `diagnose` responses and to auto-enrich long-lived operational knowledge.
+
+See: `docs/memory-system-design.md`.
+
 ## Architecture
 
 Manastone is built around **one MCP server per hardware subsystem**. Each server runs on a dedicated port, shares a common DDS bridge and event log, and can be enabled/disabled independently via `config/servers.yaml`.

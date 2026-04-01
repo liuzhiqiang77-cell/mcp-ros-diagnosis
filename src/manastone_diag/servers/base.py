@@ -32,6 +32,8 @@ class AppState:
     event_log:       object           # EventLog
     event_detector:  object           # EventDetector
     orchestrator:    object           # DiagnosticOrchestrator
+    memory_store:    object           # FileMemoryStore
+    memory_extractor: object          # MemDirExtractor
     robot_id:        str
     mock_mode:       bool
     schema_path:     Path
@@ -93,10 +95,33 @@ async def init_shared_state(
     )
     await detector.start()
 
-    # LLM + Orchestrator
+    # LLM + Orchestrator + MemDir
     llm = LLMClient(config.llm)
+
+    from ..memory.memdir import ensure_robot_identity_memory
+    from ..memory.store import FileMemoryStore
+    from ..memory.extractor import MemDirExtractor
+
+    # Deterministic identity memory (robot_fact)
+    try:
+        ensure_robot_identity_memory(
+            storage_dir=storage_dir,
+            robot_id=robot_id,
+            robot_type=schema.robot_type,
+            mock_mode=mock_mode,
+            schema_path=str(schema_path),
+        )
+    except Exception:
+        pass
+
+    memory_store = FileMemoryStore(storage_dir=storage_dir, robot_id=robot_id)
+    memory_extractor = MemDirExtractor(storage_dir=storage_dir, robot_id=robot_id, llm=llm)
+
     orchestrator = DiagnosticOrchestrator(
-        llm=llm, knowledge_dir=config.knowledge_dir,
+        llm=llm,
+        knowledge_dir=config.knowledge_dir,
+        memory_store=memory_store,
+        memory_extractor=memory_extractor,
     )
 
     _shared = AppState(
@@ -105,6 +130,8 @@ async def init_shared_state(
         event_log=event_log,
         event_detector=detector,
         orchestrator=orchestrator,
+        memory_store=memory_store,
+        memory_extractor=memory_extractor,
         robot_id=robot_id,
         mock_mode=mock_mode,
         schema_path=schema_path,
