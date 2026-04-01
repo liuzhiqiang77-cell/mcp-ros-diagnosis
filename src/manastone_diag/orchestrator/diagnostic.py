@@ -53,8 +53,17 @@ _SKILL_KEYWORDS: dict[str, list[str]] = {
 
 
 class DiagnosticOrchestrator:
-    def __init__(self, llm: LLMClient, knowledge_dir: str, skills_dir: str | None = None):
+    def __init__(
+        self,
+        llm: LLMClient,
+        knowledge_dir: str,
+        skills_dir: str | None = None,
+        memory_store: Any | None = None,
+        memory_extractor: Any | None = None,
+    ):
         self.llm = llm
+        self.memory_store = memory_store
+        self.memory_extractor = memory_extractor
         if skills_dir is None:
             skills_dir = os.path.join(knowledge_dir, "skills")
         self.yaml_skills = self._load_yaml_skills(knowledge_dir)
@@ -201,8 +210,20 @@ class DiagnosticOrchestrator:
         yaml_skills = self._find_yaml_skills(user_message, context_text)
         skill_files = self._find_skill_files(user_message, context_text)
 
+        # Build memory recall context (offline-friendly)
+        mem_ctx = ""
+        if self.memory_store is not None:
+            try:
+                mem_ctx = self.memory_store.build_recall_context(user_message)
+            except Exception:
+                mem_ctx = ""
+
         # 构建 prompt
-        prompt = f"""用户问题：{user_message}
+        prompt = ""
+        if mem_ctx:
+            prompt += mem_ctx + "\n\n"
+
+        prompt += f"""用户问题：{user_message}
 
 【活跃告警（基于实时传感器，客观事实）】
 {self._fmt_active_warnings(active_warnings)}
@@ -221,10 +242,33 @@ class DiagnosticOrchestrator:
 
         # 调用 LLM
         try:
-            return await self.llm.chat(prompt, system_prompt=SYSTEM_PROMPT)
+            response = await self.llm.chat(prompt, system_prompt=SYSTEM_PROMPT)
         except Exception as e:
             logger.error("LLM call failed: %s", e)
-            return self._fallback(active_warnings, yaml_skills)
+            response = self._fallback(active_warnings, yaml_skills)
+
+        # Best-effort: auto-enrich persistent memories after each query
+        if self.memory_extractor is not None:
+            try:
+                ctx_summary = (
+                    "Active warnings:\n" + self._fmt_active_warnings(active_warnings) + "\n\n" +
+                    f"Event stats: {event_stats}"
+                )
+                from ..memory.extractor import ExtractContext
+
+                rid = getattr(self.memory_extractor, "robot_id", "unknown")
+                await self.memory_extractor.extract_and_apply(
+                    ExtractContext(
+                        robot_id=rid,
+                        user_query=user_message,
+                        context_summary=ctx_summary[:2000],
+                        response_summary=str(response)[:1200],
+                    )
+                )
+            except Exception:
+                pass
+
+        return response
 
     def _fallback(self, warnings: list[dict], skills: list[dict]) -> str:
         lines = ["**（LLM 不可用，基于规则响应）**", ""]
